@@ -70,11 +70,23 @@ public:
 };
 extern MockSerial Serial;
 
+// Mock control and simulation
 void setAnalogValue(uint8_t pin, int value);
 void setDigitalValue(uint8_t pin, int value);
 int getDigitalValue(uint8_t pin);
 int getPWMValue(uint8_t pin);
 void resetMock();
 void setDischargeTime(uint8_t pin, int time_us);
+
+// Battery simulation
+struct BatterySim {
+    float ocv_mv;       // Open Circuit Voltage (mV)
+    float ir_ohms;      // Internal Resistance (Ohms)
+    float capacity_mah; // Capacity (mAh)
+    float current_ma;   // Current (mA)
+};
+
+extern BatterySim globalBattery;
+void updateBatterySim(float dt_s, float charge_efficiency = 1.0);
 
 #endif
