@@ -4,6 +4,11 @@
 // Always verify the code and test it with proper equipment before using it with your battery, load, and thermistor.
 // Make sure you have a battery protection board or circuit to prevent overcharging, overdischarging, short-circuiting, or overheating of your battery.
 
+#include <avr/io.h>
+#include <avr/wdt.h>
+#include <avr/sleep.h>
+#include <avr/interrupt.h>
+
 // Define the pins
 #define CHARGE_PIN 0 // PWM pin to control the charging MOSFET
 #define VOLTAGE_PIN 1 // Analog pin to measure the battery voltage
@@ -13,24 +18,22 @@
 #define REFERENCE_PIN 5 // Digital pin to charge and discharge the capacitor through the reference resistor
 
 // Define the constants
-#define MAX_VOLTAGE 4000 // Maximum charge voltage in millivolts
-#define MIN_VOLTAGE 3800 // Minimum voltage to start charging in millivolts
+#define MAX_VOLTAGE 4200 // Maximum charge voltage in millivolts
+#define MIN_VOLTAGE 3000 // Minimum voltage to start charging in millivolts
 #define MAX_CURRENT 500 // Maximum charge current in milliamps
 #define MIN_CURRENT 50 // Minimum current to terminate charging in milliamps
 #define MAX_TEMPERATURE 45 // Maximum temperature to charge in degrees Celsius
-#define MIN_TEMPERATURE 15 // Minimum temperature to charge in degrees Celsius
+#define MIN_TEMPERATURE 0 // Minimum temperature to charge in degrees Celsius
 #define WDT_TIMEOUT 8 // Watchdog timer timeout in seconds
-#define SLEEP_TIME 1 // Sleep time between measurements in seconds
-#define MAX_LOAD_VOLTAGE 3800 // Maximum battery voltage to allow maximum load PWM in millivolts
+#define SLEEP_TIME 60 // Sleep time between measurements in seconds
+#define MAX_LOAD_VOLTAGE 4000 // Maximum battery voltage to allow maximum load PWM in millivolts
 #define MIN_LOAD_VOLTAGE 3200 // Minimum battery voltage to allow minimum load PWM in millivolts
 #define MAX_LOAD_PWM 255 // Maximum load PWM value
 #define MIN_LOAD_PWM 0 // Minimum load PWM value
 #define REFERENCE_RESISTOR 10000 // Reference resistor value in ohms
-#define THERMISTOR_RESISTOR 10000 // Thermistor resistor value at 25 degrees Celsius in ohms
+#define THERMISTOR_NOMINAL_RESISTOR 10000 // Thermistor resistor value at 25 degrees Celsius in ohms
 #define THERMISTOR_BETA 3950 // Thermistor beta coefficient in Kelvin
-#define THERMISTOR_CAPACITOR 0.000001 // Thermistor capacitor value in Farads
-#define REFERENCE_CAPACITOR 0.000001 // Reference capacitor value in Farads
-#define REFERENCE_VOLTAGE 1100 // Reference voltage in millivolts
+#define INTERNAL_REFERENCE 1100 // Internal reference voltage in millivolts
 
 // Define the variables
 int chargeValue = 0; // PWM value to control the charging MOSFET
@@ -38,14 +41,15 @@ int voltageValue = 0; // Analog value to measure the battery voltage
 int currentValue = 0; // Analog value to measure the charging current
 int temperatureValue = 0; // Analog value to measure the thermistor voltage
 int loadValue = 0; // PWM value to control the load MOSFET
-int referenceValue = 0; // Analog value to measure the reference voltage
 int voltage = 0; // Battery voltage in millivolts
 int current = 0; // Charging current in milliamps
 int temperature = 0; // Battery temperature in degrees Celsius
 bool charging = false; // Charging status flag
-float referenceResistance = 0; // Reference resistance in ohms
-float thermistorResistance = 0; // Thermistor resistance in ohms
-float thermistorTemperature = 0; // Thermistor temperature in Kelvin
+float supplyVoltage = 5000; // Default supply voltage in millivolts
+
+// Forward declarations for functions
+void reset_watchdog();
+void stop_charging();
 
 // Initialize the watchdog timer
 void setup_watchdog(int timeout) {
@@ -70,22 +74,20 @@ void setup_watchdog(int timeout) {
     reset_watchdog();
     // Start the watchdog timer
     MCUSR &= ~bit(WDRF);
-    WDTCSR |= bit(WDCE) | bit(WDE);
-    WDTCSR = wdtcsr;
+    WDTCR |= bit(WDCE) | bit(WDE);
+    WDTCR = wdtcsr;
   }
   else {
     // Disable the watchdog timer
     MCUSR &= ~bit(WDRF);
-    WDTCSR |= bit(WDCE) | bit(WDE);
-    WDTCSR = 0x00;
+    WDTCR |= bit(WDCE) | bit(WDE);
+    WDTCR = 0x00;
   }
 }
 
 // Reset the watchdog timer
 void reset_watchdog() {
-  __asm__ __volatile__ (
-    "wdr\n"
-  );
+  wdt_reset();
 }
 
 // Enter sleep mode
@@ -99,7 +101,7 @@ void enter_sleep() {
 // Read the battery voltage
 void read_voltage() {
   voltageValue = analogRead(VOLTAGE_PIN); // Read the analog value
-  voltage = map(voltageValue, 0, 1023, 0, 5000); // Map the value to millivolts
+  voltage = map(voltageValue, 0, 1023, 0, (int)supplyVoltage); // Map the value to millivolts using current supply voltage
 }
 
 // Read the charging current
@@ -108,23 +110,45 @@ void read_current() {
   current = map(currentValue, 0, 1023, 0, 1000); // Map the value to milliamps
 }
 
-// Read the thermistor voltage
-void read_temperature() {
-  // Charge the capacitor through the thermistor
-  pinMode(TEMPERATURE_PIN, OUTPUT); // Set the pin as output
-  digitalWrite(TEMPERATURE_PIN, HIGH); // Set the pin high
-  delay(10); // Wait for 10 milliseconds
-  // Discharge the capacitor and measure the time
-  pinMode(TEMPERATURE_PIN, INPUT); // Set the pin as input
-  unsigned long startTime = micros(); // Record the start time
-  while (digitalRead(TEMPERATURE_PIN) == HIGH) {} // Wait until the pin goes low
-  unsigned long endTime = micros(); // Record the end time
-  // Calculate the thermistor resistance
-  float dischargeTime = (float)(endTime - startTime) / 1000000.0; // Calculate the discharge time in seconds
-  thermistorResistance = THERMISTOR_RESISTOR * (exp(dischargeTime / (THERMISTOR_CAPACITOR * THERMISTOR_RESISTOR)) - 1.0); // Calculate the thermistor resistance in ohms
-  // Calculate the thermistor temperature
-  thermistorTemperature = THERMISTOR_BETA / log(thermistorResistance / THERMISTOR_RESISTOR); // Calculate the thermistor temperature in Kelvin
-  temperature = thermistorTemperature - 273.15; // Convert the temperature to degrees Celsius
+// Measure discharge time of a capacitor on a pin
+unsigned long measure_discharge_time(uint8_t pin) {
+  // Charge the capacitor to Vcc
+  pinMode(pin, OUTPUT);
+  digitalWrite(pin, HIGH);
+  delay(10);
+
+  // Start discharging and measure time to reach logic LOW
+  pinMode(pin, INPUT);
+  unsigned long startTime = micros();
+  while (digitalRead(pin) == HIGH) {
+      if (micros() - startTime > 100000) break; // Timeout 100ms
+  }
+  unsigned long endTime = micros();
+  return endTime - startTime;
+}
+
+// Read the thermistor and supply voltage
+void read_temperature_and_supply() {
+  unsigned long t_ref = measure_discharge_time(REFERENCE_PIN);
+  unsigned long t_ntc = measure_discharge_time(TEMPERATURE_PIN);
+
+  if (t_ref > 0 && t_ntc > 0) {
+      // t = R * C * ln(Vcc / Vth)
+      // Since C and ln(Vcc / Vth) are approximately constant:
+      // t_ntc / t_ref = R_ntc / R_ref
+      float thermistorResistance = (float)REFERENCE_RESISTOR * (float)t_ntc / (float)t_ref;
+
+      // Calculate temperature using Steinhart-Hart (Beta model)
+      float steinhart;
+      steinhart = thermistorResistance / THERMISTOR_NOMINAL_RESISTOR; // (R/Ro)
+      steinhart = log(steinhart);                  // ln(R/Ro)
+      steinhart /= THERMISTOR_BETA;                // 1/B * ln(R/Ro)
+      steinhart += 1.0 / (25.0 + 273.15);          // + (1/To)
+      steinhart = 1.0 / steinhart;                 // Invert
+      steinhart -= 273.15;                         // convert to C
+
+      temperature = (int)steinhart;
+  }
 }
 
 // Start charging
@@ -149,12 +173,12 @@ void adjust_charging() {
   }
   else if (current >= MAX_CURRENT) {
     // Charging current is too high, reduce the PWM value
-    chargeValue--;
+    if (chargeValue > 0) chargeValue--;
     analogWrite(CHARGE_PIN, chargeValue);
   }
   else if (current <= MIN_CURRENT && voltage >= MIN_VOLTAGE) {
     // Charging current is too low, increase the PWM value
-    chargeValue++;
+    if (chargeValue < 255) chargeValue++;
     analogWrite(CHARGE_PIN, chargeValue);
   }
 }
@@ -162,81 +186,49 @@ void adjust_charging() {
 // Check the battery temperature
 void check_temperature() {
   if (temperature >= MAX_TEMPERATURE || temperature <= MIN_TEMPERATURE) {
-    // Temperature is out of range,stop charging and reduce the load PWM value
+    // Temperature is out of range, stop charging
+    stop_charging();
   }
 }
 
 // Control the load
 void control_load() {
   if (voltage >= MAX_LOAD_VOLTAGE) {
-    // Battery voltage is high enough, allow maximum load PWM
     loadValue = MAX_LOAD_PWM;
-    analogWrite(LOAD_PIN, loadValue);
   }
   else if (voltage <= MIN_LOAD_VOLTAGE) {
-    // Battery voltage is too low, allow minimum load PWM
     loadValue = MIN_LOAD_PWM;
-    analogWrite(LOAD_PIN, loadValue);
   }
   else {
-    // Battery voltage is in between, scale the load PWM accordingly
     loadValue = map(voltage, MIN_LOAD_VOLTAGE, MAX_LOAD_VOLTAGE, MIN_LOAD_PWM, MAX_LOAD_PWM);
-    analogWrite(LOAD_PIN, loadValue);
   }
-}
-
-// Read the reference voltage
-void read_reference() {
-  // Charge the capacitor through the reference resistor
-  pinMode(REFERENCE_PIN, OUTPUT); // Set the pin as output
-  digitalWrite(REFERENCE_PIN, HIGH); // Set the pin high
-  delay(10); // Wait for 10 milliseconds
-  // Discharge the capacitor and measure the time
-  pinMode(REFERENCE_PIN, INPUT); // Set the pin as input
-  unsigned long startTime = micros(); // Record the start time
-  while (digitalRead(REFERENCE_PIN) == HIGH) {} // Wait until the pin goes low
-  unsigned long endTime = micros(); // Record the end time
-  // Calculate the reference resistance
-  float dischargeTime = (float)(endTime - startTime) / 1000000.0; // Calculate the discharge time in seconds
-  referenceResistance = REFERENCE_RESISTOR * (exp(dischargeTime / (REFERENCE_CAPACITOR * REFERENCE_RESISTOR)) - 1.0); // Calculate the reference resistance in ohms
-  // Calculate the reference voltage
-  referenceValue = analogRead(TEMPERATURE_PIN); // Read the analog value
-  float referenceVoltage = map(referenceValue, 0, 1023, 0, 5000); // Map the value to millivolts
-  referenceVoltage = referenceVoltage * referenceResistance / (referenceResistance + REFERENCE_RESISTOR); // Calculate the reference voltage in millivolts
-  // Adjust the battery voltage and the thermistor temperature according to the reference voltage
-  voltage = voltage * REFERENCE_VOLTAGE / referenceVoltage; // Adjust the battery voltage in millivolts
-  thermistorTemperature = thermistorTemperature * referenceVoltage / REFERENCE_VOLTAGE; // Adjust the thermistor temperature in Kelvin
-  temperature = thermistorTemperature - 273.15; // Convert the temperature to degrees Celsius
+  analogWrite(LOAD_PIN, loadValue);
 }
 
 // Setup the pins and the watchdog timer
 void setup() {
-  pinMode(CHARGE_PIN, OUTPUT); // Set the charge pin as output
-  pinMode(VOLTAGE_PIN, INPUT); // Set the voltage pin as input
-  pinMode(CURRENT_PIN, INPUT); // Set the current pin as input
-  pinMode(TEMPERATURE_PIN, INPUT); // Set the temperature pin as input
-  pinMode(LOAD_PIN, OUTPUT); // Set the load pin as output
-  pinMode(REFERENCE_PIN, INPUT); // Set the reference pin as input
-  setup_watchdog(WDT_TIMEOUT); // Setup the watchdog timer with the timeout
+  pinMode(CHARGE_PIN, OUTPUT);
+  pinMode(VOLTAGE_PIN, INPUT);
+  pinMode(CURRENT_PIN, INPUT);
+  pinMode(TEMPERATURE_PIN, INPUT);
+  pinMode(LOAD_PIN, OUTPUT);
+  pinMode(REFERENCE_PIN, INPUT);
+  setup_watchdog(WDT_TIMEOUT);
 }
 
 // Loop the measurements and the charging logic
 void loop() {
-  read_voltage(); // Read the battery voltage
-  read_current(); // Read the charging current
-  read_temperature(); // Read the thermistor voltage
-  read_reference(); // Read the reference voltage
+  read_temperature_and_supply();
+  read_voltage();
+  read_current();
   if (voltage <= MIN_VOLTAGE) {
-    // Battery is too low, start charging
     start_charging();
   }
-  else {
-    // Battery is above the minimum voltage, adjust charging
+  else if (charging) {
     adjust_charging();
   }
-  check_temperature(); // Check the battery temperature
-  control_load(); // Control the load
-  reset_watchdog(); // Reset the watchdog timer
-  delay(SLEEP_TIME * 1000); // Wait for the sleep time
-  enter_sleep(); // Enter sleep mode
+  check_temperature();
+  control_load();
+  reset_watchdog();
+  delay(10);
 }
