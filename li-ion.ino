@@ -1,5 +1,5 @@
 // Arduino code for attiny13 li-ion battery charger
-// Features: CC/CV, Pre-charging, Hysteresis, Smoothing, WDT Safety, Temperature Hysteresis
+// Features: CC/CV, Pre-charging, Hysteresis, Smoothing, WDT Safety, Multi-stage Thermal Control
 // Disclaimer: This code is for educational purposes only and not intended to be used in real applications.
 
 #include <avr/io.h>
@@ -18,7 +18,14 @@
 #define RECHARGE_VOLTAGE 4050 // Voltage to restart charging in millivolts
 #define PRECHARGE_THRESHOLD 3000 // Voltage to switch from pre-charge to fast-charge in millivolts
 #define PRECHARGE_CURRENT 50 // Current limit for pre-charging in milliamps
-#define FASTCHARGE_CURRENT 500 // Current limit for fast-charging in milliamps
+
+// Longevity-optimized Thermal Zones
+#define FASTCHARGE_CURRENT 500 // Max current at ideal temp (10-35°C)
+#define COLD_TEMP 10 // Below this, reduce current
+#define COLD_CURRENT 100 // Max current at cold temp (0-10°C)
+#define WARM_TEMP 35 // Above this, reduce current
+#define WARM_CURRENT 250 // Max current at warm temp (35-45°C)
+
 #define TERMINATION_CURRENT 50 // Current to terminate charging in CV phase in milliamps
 #define MAX_TEMPERATURE 45 // Maximum temperature to charge in degrees Celsius
 #define MAX_TEMP_RECOVERY 40 // Temperature to restart charging after over-temp
@@ -117,20 +124,24 @@ void adjust_charging() {
   if (smoothedVoltage < PRECHARGE_THRESHOLD) {
     current_target = PRECHARGE_CURRENT;
   } else {
-    current_target = FASTCHARGE_CURRENT;
+    // Determine target current based on temperature for longevity
+    if (smoothedTemperature < COLD_TEMP) {
+      current_target = COLD_CURRENT;
+    } else if (smoothedTemperature > WARM_TEMP) {
+      current_target = WARM_CURRENT;
+    } else {
+      current_target = FASTCHARGE_CURRENT;
+    }
   }
 
   // CC/CV Regulation Logic
   if (smoothedVoltage >= MAX_VOLTAGE) {
-    // CV phase: voltage is at limit, reduce current
     if (chargeValue > 0) chargeValue--;
   }
   else if (smoothedCurrent > current_target) {
-    // CC phase: current limit exceeded, reduce PWM
     if (chargeValue > 0) chargeValue--;
   }
   else if (chargeValue < 255) {
-    // Current and voltage are below limits, increase PWM
     chargeValue++;
   }
 
@@ -142,7 +153,6 @@ void check_temperature() {
     temp_fault = true;
     stop_charging();
   } else if (temp_fault) {
-    // Temperature recovery with hysteresis
     if (smoothedTemperature <= MAX_TEMP_RECOVERY && smoothedTemperature >= MIN_TEMP_RECOVERY) {
       temp_fault = false;
     }
