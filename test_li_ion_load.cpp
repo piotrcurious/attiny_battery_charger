@@ -1,39 +1,37 @@
 #include <iostream>
 #include <cassert>
+#include <vector>
 #include "mock_arduino/Arduino.h"
 
-// Forward declare setup and loop from the ino file
 void setup();
 void loop();
 
 #include "li-ion_with_load.ino"
 
 int main() {
-    std::cout << "Testing li-ion_with_load.ino..." << std::endl;
+    std::cout << "Testing li-ion_with_load.ino with EMA and Load Scaling..." << std::endl;
 
-    // Test setup
     resetMock();
     setup();
 
-    // Test battery voltage reading - too low, should start charging and disable load
-    setAnalogValue(VOLTAGE_PIN, 500); // ~2443mV
-    setAnalogValue(TEMPERATURE_PIN, 512); // ~42.5C
-    loop();
-
-    std::cout << "Voltage: " << voltage << "mV, Charging: " << charging << ", Load PWM: " << getPWMValue(LOAD_PIN) << std::endl;
+    // Low battery
+    setAnalogValue(VOLTAGE_PIN, map(3100, 0, 5000, 0, 1023));
+    setAnalogValue(TEMPERATURE_PIN, map(25, -40, 125, 0, 1023));
+    for (int i=0; i<20; i++) loop(); // Stabilize
+    std::cout << "Voltage: " << (int)smoothedVoltage << "mV, Charging: " << charging << ", Load PWM: " << getPWMValue(LOAD_PIN) << std::endl;
     assert(charging == true);
     assert(getPWMValue(LOAD_PIN) == MIN_LOAD_PWM);
 
-    // Test battery voltage reading - half-charged, should scale load
-    setAnalogValue(VOLTAGE_PIN, 737); // map(737, 0, 1023, 0, 5000) = 3602mV
-    loop();
-    std::cout << "Voltage: " << voltage << "mV, Load PWM: " << getPWMValue(LOAD_PIN) << std::endl;
+    // Medium battery
+    setAnalogValue(VOLTAGE_PIN, map(3600, 0, 5000, 0, 1023));
+    for (int i=0; i<20; i++) loop();
+    std::cout << "Voltage: " << (int)smoothedVoltage << "mV, Load PWM: " << getPWMValue(LOAD_PIN) << std::endl;
     assert(getPWMValue(LOAD_PIN) > MIN_LOAD_PWM && getPWMValue(LOAD_PIN) < MAX_LOAD_PWM);
 
-    // Test battery voltage reading - high voltage, should allow full load
-    setAnalogValue(VOLTAGE_PIN, 819); // map(819, 0, 1023, 0, 5000) = 4002mV
-    loop();
-    std::cout << "Voltage: " << voltage << "mV, Load PWM: " << getPWMValue(LOAD_PIN) << std::endl;
+    // High battery
+    setAnalogValue(VOLTAGE_PIN, map(4100, 0, 5000, 0, 1023));
+    for (int i=0; i<20; i++) loop();
+    std::cout << "Voltage: " << (int)smoothedVoltage << "mV, Load PWM: " << getPWMValue(LOAD_PIN) << std::endl;
     assert(getPWMValue(LOAD_PIN) == MAX_LOAD_PWM);
 
     std::cout << "li-ion_with_load.ino tests passed!" << std::endl;
