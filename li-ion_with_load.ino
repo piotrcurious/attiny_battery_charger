@@ -1,5 +1,5 @@
 // Arduino code for attiny13 li-ion battery charger with load control
-// Features: CC/CV, Pre-charging, Load PWM scaling, Hysteresis, Smoothing
+// Features: CC/CV, Pre-charging, Load PWM scaling, Hysteresis, Smoothing, Temperature Hysteresis
 // Disclaimer: This code is for educational purposes only and not intended to be used in real applications.
 
 #include <avr/io.h>
@@ -22,7 +22,9 @@
 #define FASTCHARGE_CURRENT 500 // Current limit for fast-charging in milliamps
 #define TERMINATION_CURRENT 50 // Current to terminate charging in CV phase in milliamps
 #define MAX_TEMPERATURE 45 // Maximum temperature to charge in degrees Celsius
+#define MAX_TEMP_RECOVERY 40 // Temperature to restart charging after over-temp
 #define MIN_TEMPERATURE 0 // Minimum temperature to charge in degrees Celsius
+#define MIN_TEMP_RECOVERY 5 // Temperature to restart charging after under-temp
 #define MAX_LOAD_VOLTAGE 4000 // Maximum battery voltage to allow maximum load PWM in millivolts
 #define MIN_LOAD_VOLTAGE 3200 // Minimum battery voltage to allow minimum load PWM in millivolts
 #define MAX_LOAD_PWM 255 // Maximum load PWM value
@@ -37,6 +39,7 @@ float smoothedCurrent = 0; // Smoothed charging current in milliamps
 float smoothedTemperature = 25; // Smoothed battery temperature in degrees Celsius
 int loadValue = 0; // PWM value to control the load MOSFET
 bool charging = false; // Charging status flag
+bool temp_fault = false; // Temperature fault flag
 
 // Forward declarations
 void reset_watchdog();
@@ -86,6 +89,7 @@ void update_readings() {
 }
 
 void start_charging() {
+  if (temp_fault) return;
   charging = true;
   chargeValue = 10;
   analogWrite(CHARGE_PIN, chargeValue);
@@ -98,6 +102,11 @@ void stop_charging() {
 }
 
 void adjust_charging() {
+  if (temp_fault) {
+    stop_charging();
+    return;
+  }
+
   if (smoothedVoltage >= MAX_VOLTAGE - 10 && smoothedCurrent <= TERMINATION_CURRENT && chargeValue < 100) {
     stop_charging();
     return;
@@ -130,7 +139,12 @@ void adjust_charging() {
 
 void check_temperature() {
   if (smoothedTemperature >= MAX_TEMPERATURE || smoothedTemperature <= MIN_TEMPERATURE) {
+    temp_fault = true;
     stop_charging();
+  } else if (temp_fault) {
+    if (smoothedTemperature <= MAX_TEMP_RECOVERY && smoothedTemperature >= MIN_TEMP_RECOVERY) {
+      temp_fault = false;
+    }
   }
 }
 
@@ -158,16 +172,16 @@ void setup() {
 
 void loop() {
   update_readings();
+  check_temperature();
 
   if (smoothedVoltage >= MAX_VOLTAGE + 50) {
       stop_charging();
-  } else if (!charging && smoothedVoltage <= RECHARGE_VOLTAGE) {
+  } else if (!charging && smoothedVoltage <= RECHARGE_VOLTAGE && !temp_fault) {
       start_charging();
   } else if (charging) {
       adjust_charging();
   }
 
-  check_temperature();
   control_load();
   reset_watchdog();
   delay(10);

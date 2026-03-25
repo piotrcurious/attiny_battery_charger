@@ -78,12 +78,13 @@ int getPWMValue(uint8_t pin);
 void resetMock();
 void setDischargeTime(uint8_t pin, int time_us);
 
-// Battery simulation
+// Battery and Environment simulation
 struct BatterySim {
     float ocv_mv;       // Open Circuit Voltage (mV)
     float ir_ohms;      // Internal Resistance (Ohms)
     float capacity_mah; // Capacity (mAh)
     float current_ma;   // Current (mA)
+    float temp_c;       // Temperature (Celsius)
 };
 
 extern BatterySim globalBattery;
