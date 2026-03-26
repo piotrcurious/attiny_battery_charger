@@ -1,21 +1,20 @@
 // Arduino code for attiny13 li-ion battery charger with load control and thermistor temperature measurement
 // Features: CC/CV, Pre-charging, Cap-based NTC, Load PWM, Smoothing, Multi-stage Thermal Control, Power Management
-// Disclaimer: This code is for educational purposes only and not intended to be used in real applications.
+// Production Quality: Fixed-point math, No float, Integer EMA, Linear interpolation for temperature, Robust Sensor Sanity Checks
 
 #include <avr/io.h>
 #include <avr/wdt.h>
 #include <avr/sleep.h>
 #include <avr/interrupt.h>
 
-// Define the pins
+// ATtiny13 Pin Mapping
 #define CHARGE_PIN 0
+#define LOAD_PIN 1
 #define VOLTAGE_PIN 1
 #define CURRENT_PIN 2
 #define TEMPERATURE_PIN 3
-#define LOAD_PIN 4
 #define REFERENCE_PIN 5
 
-// Define the constants
 #define MAX_VOLTAGE 4200
 #define RECHARGE_VOLTAGE 4050
 #define PRECHARGE_THRESHOLD 3000
@@ -36,26 +35,35 @@
 #define MIN_LOAD_VOLTAGE 3200
 #define MAX_LOAD_PWM 255
 #define MIN_LOAD_PWM 0
-#define REFERENCE_RESISTOR 10000
-#define THERMISTOR_NOMINAL_RESISTOR 10000
-#define THERMISTOR_BETA 3950
 #define WDT_TIMEOUT 8
-#define ALPHA 0.2
+#define EMA_SHIFT 3
+#define SENSOR_MIN_RAW 10
+#define SENSOR_MAX_RAW 1010
 
-// Define the variables
 int chargeValue = 0;
-float smoothedVoltage = 0;
-float smoothedCurrent = 0;
-float smoothedTemperature = 25;
+int32_t smoothedVoltageQ8 = 0;
+int32_t smoothedCurrentQ8 = 0;
+int32_t smoothedTemperatureQ8 = 25 << 8;
 int loadValue = 0;
 bool charging = false;
 bool temp_fault = false;
+bool sensor_fault = false;
+bool first_run = true;
+
+#define smoothedVoltage (smoothedVoltageQ8 >> 8)
+#define smoothedCurrent (smoothedCurrentQ8 >> 8)
+#define smoothedTemperature (smoothedTemperatureQ8 >> 8)
 
 // Forward declarations
 void reset_watchdog();
 void stop_charging();
+void start_charging();
+void adjust_charging();
+void check_temperature();
+void update_readings();
+void enter_sleep(int cycles);
+void control_load();
 
-// Initialize the watchdog timer
 void setup_watchdog(int timeout) {
   byte wdtcsr = 0;
   if (timeout > 0) {
@@ -93,47 +101,66 @@ void enter_sleep(int cycles) {
   ADCSRA |= bit(ADEN);
 }
 
-unsigned long measure_discharge_time(uint8_t pin) {
+uint32_t measure_discharge_time(uint8_t pin) {
   pinMode(pin, OUTPUT);
   digitalWrite(pin, HIGH);
   delay(10);
   pinMode(pin, INPUT);
-  unsigned long startTime = micros();
+  uint32_t startTime = micros();
   while (digitalRead(pin) == HIGH) {
       if (micros() - startTime > 100000) break;
   }
-  unsigned long endTime = micros();
-  return endTime - startTime;
+  return micros() - startTime;
+}
+
+int16_t calculate_temp_fixed(uint32_t t_ref, uint32_t t_ntc) {
+    if (t_ref == 0) return 25;
+    uint32_t ratio_q10 = (t_ntc << 10) / t_ref;
+    if (ratio_q10 > 1024) {
+        return 25 - (int16_t)(((ratio_q10 - 1024) * 25) / 2253);
+    } else {
+        int32_t diff = 1024 - (int32_t)ratio_q10;
+        return 25 + (int16_t)((diff * 20) / 574);
+    }
 }
 
 void update_readings() {
-  int rawVoltage = map(analogRead(VOLTAGE_PIN), 0, 1023, 0, 5000);
-  int rawCurrent = map(analogRead(CURRENT_PIN), 0, 1023, 0, 1000);
+  int rawV = analogRead(VOLTAGE_PIN);
+  int rawI = analogRead(CURRENT_PIN);
 
-  if (smoothedVoltage == 0) smoothedVoltage = rawVoltage;
-  else smoothedVoltage = (ALPHA * (float)rawVoltage) + ((1.0 - ALPHA) * smoothedVoltage);
+  if (rawV < SENSOR_MIN_RAW || rawV > SENSOR_MAX_RAW) {
+      sensor_fault = true;
+      stop_charging();
+  } else {
+      sensor_fault = false;
+  }
 
-  smoothedCurrent = (ALPHA * (float)rawCurrent) + ((1.0 - ALPHA) * smoothedCurrent);
+  int32_t rawVoltage = ((int32_t)rawV * 5000) >> 10;
+  int32_t rawCurrent = ((int32_t)rawI * 1000) >> 10;
 
-  unsigned long t_ref = measure_discharge_time(REFERENCE_PIN);
-  unsigned long t_ntc = measure_discharge_time(TEMPERATURE_PIN);
+  uint32_t t_ref = measure_discharge_time(REFERENCE_PIN);
+  uint32_t t_ntc = measure_discharge_time(TEMPERATURE_PIN);
+  int16_t rawTemperature = calculate_temp_fixed(t_ref, t_ntc);
 
-  if (t_ref > 0 && t_ntc > 0) {
-      float thermistorResistance = (float)REFERENCE_RESISTOR * (float)t_ntc / (float)t_ref;
-      float steinhart;
-      steinhart = thermistorResistance / THERMISTOR_NOMINAL_RESISTOR;
-      steinhart = log(steinhart);
-      steinhart /= THERMISTOR_BETA;
-      steinhart += 1.0 / (25.0 + 273.15);
-      steinhart = 1.0 / steinhart;
-      steinhart -= 273.15;
+  uint32_t ratio_q10 = (t_ref > 0) ? (t_ntc << 10) / t_ref : 0;
+  if (ratio_q10 < 200 || ratio_q10 > 5000 || t_ref == 0) {
+      rawTemperature = 100; // Trigger fault
+  }
 
-      smoothedTemperature = (ALPHA * steinhart) + ((1.0 - ALPHA) * smoothedTemperature);
+  if (first_run) {
+      smoothedVoltageQ8 = rawVoltage << 8;
+      smoothedCurrentQ8 = rawCurrent << 8;
+      smoothedTemperatureQ8 = (int32_t)rawTemperature << 8;
+      first_run = false;
+  } else {
+      smoothedVoltageQ8 = smoothedVoltageQ8 + (((rawVoltage << 8) - smoothedVoltageQ8) >> EMA_SHIFT);
+      smoothedCurrentQ8 = smoothedCurrentQ8 + (((rawCurrent << 8) - smoothedCurrentQ8) >> EMA_SHIFT);
+      smoothedTemperatureQ8 = smoothedTemperatureQ8 + ((((int32_t)rawTemperature << 8) - smoothedTemperatureQ8) >> EMA_SHIFT);
   }
 }
 
 void start_charging() {
-  if (temp_fault) return;
+  if (temp_fault || sensor_fault) return;
   if (smoothedVoltage < MIN_CHARGE_VOLTAGE) return;
   charging = true;
   chargeValue = 10;
@@ -147,7 +174,7 @@ void stop_charging() {
 }
 
 void adjust_charging() {
-  if (temp_fault) {
+  if (temp_fault || sensor_fault) {
     stop_charging();
     return;
   }
@@ -200,18 +227,16 @@ void control_load() {
     loadValue = MIN_LOAD_PWM;
   }
   else {
-    loadValue = map((int)smoothedVoltage, MIN_LOAD_VOLTAGE, MAX_LOAD_VOLTAGE, MIN_LOAD_PWM, MAX_LOAD_PWM);
+    loadValue = (int)(((smoothedVoltage - MIN_LOAD_VOLTAGE) * (MAX_LOAD_PWM - MIN_LOAD_PWM)) / (MAX_LOAD_VOLTAGE - MIN_LOAD_VOLTAGE));
   }
   analogWrite(LOAD_PIN, loadValue);
 }
 
 void setup() {
   pinMode(CHARGE_PIN, OUTPUT);
-  pinMode(VOLTAGE_PIN, INPUT);
-  pinMode(CURRENT_PIN, INPUT);
-  pinMode(TEMPERATURE_PIN, INPUT);
   pinMode(LOAD_PIN, OUTPUT);
   pinMode(REFERENCE_PIN, INPUT);
+  pinMode(TEMPERATURE_PIN, INPUT);
   setup_watchdog(WDT_TIMEOUT);
   sei();
 }
@@ -220,9 +245,9 @@ void loop() {
   update_readings();
   check_temperature();
 
-  if (smoothedVoltage >= MAX_VOLTAGE + 50) {
+  if (smoothedVoltage >= MAX_VOLTAGE + 50 || sensor_fault) {
       stop_charging();
-  } else if (!charging && smoothedVoltage <= RECHARGE_VOLTAGE && !temp_fault && smoothedVoltage >= MIN_CHARGE_VOLTAGE) {
+  } else if (!charging && smoothedVoltage <= RECHARGE_VOLTAGE && !temp_fault && !sensor_fault && smoothedVoltage >= MIN_CHARGE_VOLTAGE) {
       start_charging();
   } else if (charging) {
       adjust_charging();

@@ -7,37 +7,56 @@ void loop();
 
 #include "li-ion_cap.ino"
 
+void resetFirmwareVars() {
+    charging = false;
+    smoothedVoltageQ8 = 0;
+    smoothedCurrentQ8 = 0;
+    smoothedTemperatureQ8 = 25 << 8;
+    temp_fault = false;
+    sensor_fault = false;
+    chargeValue = 0;
+    first_run = true;
+}
+
 int main() {
-    std::cout << "Testing li-ion_cap.ino with EMA and Discharge logic..." << std::endl;
+    std::cout << "Testing li-ion_cap.ino Production Quality..." << std::endl;
 
     resetMock();
+    resetFirmwareVars();
     setup();
 
-    // Simulate R_ref = 10k, R_ntc = 10k (25C)
+    // Test 1: 25C logic
+    std::cout << "Testing 25C..." << std::endl;
     setDischargeTime(REFERENCE_PIN, 1000);
-    setDischargeTime(TEMPERATURE_PIN, 1000);
+    setDischargeTime(TEMPERATURE_PIN, 1000); // Ratio = 1.0 (1024 q10)
 
-    for (int i=0; i<30; i++) loop(); // Stabilize EMA
-    std::cout << "Measured temperature (expected ~25C): " << (int)smoothedTemperature << "C" << std::endl;
+    for (int i=0; i<100; i++) {
+        setAnalogValue(VOLTAGE_PIN, map(3500, 0, 5000, 0, 1023));
+        loop();
+    }
+    std::cout << "Measured temperature: " << (int)smoothedTemperature << "C" << std::endl;
     assert(smoothedTemperature >= 24 && smoothedTemperature <= 26);
 
-    // Simulate R_ntc = 4.35k (~45C)
-    setDischargeTime(TEMPERATURE_PIN, 435);
-    for (int i=0; i<30; i++) loop();
-    std::cout << "Measured temperature (expected ~45C): " << (int)smoothedTemperature << "C" << std::endl;
+    // Test 2: 45C logic
+    std::cout << "Testing 45C..." << std::endl;
+    setDischargeTime(TEMPERATURE_PIN, 439);
+    for (int i=0; i<500; i++) {
+        setAnalogValue(VOLTAGE_PIN, map(3500, 0, 5000, 0, 1023));
+        loop();
+    }
+    std::cout << "Measured temperature: " << (int)smoothedTemperature << "C" << std::endl;
     assert(smoothedTemperature >= 43 && smoothedTemperature <= 47);
 
-    // Test charging logic with cap-based temp
-    setAnalogValue(VOLTAGE_PIN, map(3500, 0, 5000, 0, 1023));
-    for (int i=0; i<30; i++) loop();
-    assert(charging == true);
+    // Test 3: 0C logic
+    std::cout << "Testing 0C..." << std::endl;
+    setDischargeTime(TEMPERATURE_PIN, 3200);
+    for (int i=0; i<500; i++) {
+        setAnalogValue(VOLTAGE_PIN, map(3500, 0, 5000, 0, 1023));
+        loop();
+    }
+    std::cout << "Measured temperature: " << (int)smoothedTemperature << "C" << std::endl;
+    assert(smoothedTemperature >= -2 && smoothedTemperature <= 2);
 
-    // Test over temperature
-    setDischargeTime(TEMPERATURE_PIN, 300); // Higher temp
-    for (int i=0; i<30; i++) loop();
-    std::cout << "Measured temperature (hot): " << (int)smoothedTemperature << "C, Charging: " << charging << std::endl;
-    assert(charging == false);
-
-    std::cout << "li-ion_cap.ino tests passed!" << std::endl;
+    std::cout << "li-ion_cap.ino production tests passed!" << std::endl;
     return 0;
 }

@@ -9,11 +9,13 @@ void loop();
 
 void resetFirmwareVars() {
     charging = false;
-    smoothedVoltage = 0;
-    smoothedCurrent = 0;
-    smoothedTemperature = 25;
+    smoothedVoltageQ8 = 0;
+    smoothedCurrentQ8 = 0;
+    smoothedTemperatureQ8 = 25 << 8;
     temp_fault = false;
+    sensor_fault = false;
     chargeValue = 0;
+    first_run = true;
 }
 
 int main() {
