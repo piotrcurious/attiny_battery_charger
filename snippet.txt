@@ -1,0 +1,6 @@
+// EMA for temperature with float-like behavior using integers
+  if (smoothedTemperature == 25 && smoothedVoltage == 0 && !charging) {
+      smoothedTemperature = (int16_t)rawTemperature;
+  } else {
+      smoothedTemperature = (int16_t)(((int32_t)rawTemperature + ((int32_t)smoothedTemperature << EMA_SHIFT) - (int32_t)smoothedTemperature) >> EMA_SHIFT);
+  }

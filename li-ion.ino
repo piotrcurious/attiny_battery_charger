@@ -1,166 +1,215 @@
 // Arduino code for attiny13 li-ion battery charger
-// Features: maximum charge voltage, wdt safety, deep sleep, over current protection, thermal safety protection
-// Disclaimer: This code is for educational purposes only and not intended to be used in real applications.
-// Always verify the code and test it with proper equipment before using it with your battery.
-// Make sure you have a battery protection board or circuit to prevent overcharging, overdischarging, short-circuiting, or overheating of your battery.
+// Features: CC/CV, Pre-charging, Hysteresis, Smoothing, WDT Safety, Thermal Control, Sleep/Power Management
+// Production Quality: Fixed-point math, Integer EMA with precision, Robust Sensor Sanity Checks
 
-// Define the pins
-#define CHARGE_PIN 0 // PWM pin to control the charging MOSFET
-#define VOLTAGE_PIN 1 // Analog pin to measure the battery voltage
-#define CURRENT_PIN 2 // Analog pin to measure the charging current
-#define TEMPERATURE_PIN 3 // Analog pin to measure the battery temperature
+#include <avr/io.h>
+#include <avr/wdt.h>
+#include <avr/sleep.h>
+#include <avr/interrupt.h>
 
-// Define the constants
-#define MAX_VOLTAGE 4200 // Maximum charge voltage in millivolts
-#define MIN_VOLTAGE 3000 // Minimum voltage to start charging in millivolts
-#define MAX_CURRENT 500 // Maximum charge current in milliamps
-#define MIN_CURRENT 50 // Minimum current to terminate charging in milliamps
-#define MAX_TEMPERATURE 45 // Maximum temperature to charge in degrees Celsius
-#define MIN_TEMPERATURE 0 // Minimum temperature to charge in degrees Celsius
-#define WDT_TIMEOUT 8 // Watchdog timer timeout in seconds
-#define SLEEP_TIME 60 // Sleep time between measurements in seconds
+// ATtiny13 Pin Mapping
+#define CHARGE_PIN 0 // PB0 (OC0A)
+#define VOLTAGE_PIN 1 // ADC1 (PB2)
+#define CURRENT_PIN 2 // ADC2 (PB4)
+#define TEMPERATURE_PIN 3 // ADC3 (PB3)
 
-// Define the variables
-int chargeValue = 0; // PWM value to control the charging MOSFET
-int voltageValue = 0; // Analog value to measure the battery voltage
-int currentValue = 0; // Analog value to measure the charging current
-int temperatureValue = 0; // Analog value to measure the battery temperature
-int voltage = 0; // Battery voltage in millivolts
-int current = 0; // Charging current in milliamps
-int temperature = 0; // Battery temperature in degrees Celsius
-bool charging = false; // Charging status flag
+#define MAX_VOLTAGE 4200
+#define RECHARGE_VOLTAGE 4050
+#define PRECHARGE_THRESHOLD 3000
+#define ECO_MODE_THRESHOLD 2500
+#define PRECHARGE_CURRENT 50
+#define FASTCHARGE_CURRENT 500
+#define COLD_TEMP 10
+#define COLD_CURRENT 100
+#define WARM_TEMP 35
+#define WARM_CURRENT 250
+#define TERMINATION_CURRENT 50
+#define MAX_TEMPERATURE 45
+#define MAX_TEMP_RECOVERY 40
+#define MIN_TEMPERATURE 0
+#define MIN_TEMP_RECOVERY 5
+#define MIN_CHARGE_VOLTAGE 2000
+#define WDT_TIMEOUT 8
+#define EMA_SHIFT 3
 
-// Initialize the watchdog timer
+#define SENSOR_MIN_RAW 10
+#define SENSOR_MAX_RAW 1010
+
+int chargeValue = 0;
+int32_t smoothedVoltageQ8 = 0;
+int32_t smoothedCurrentQ8 = 0;
+int32_t smoothedTemperatureQ8 = 25 << 8;
+bool charging = false;
+bool temp_fault = false;
+bool sensor_fault = false;
+bool first_run = true;
+
+// Convenience macros for accessing smoothed values
+#define smoothedVoltage (smoothedVoltageQ8 >> 8)
+#define smoothedCurrent (smoothedCurrentQ8 >> 8)
+#define smoothedTemperature (smoothedTemperatureQ8 >> 8)
+
+// Forward declarations
+void reset_watchdog();
+void stop_charging();
+void start_charging();
+void adjust_charging();
+void check_temperature();
+void update_readings();
+void enter_sleep(int cycles);
+
 void setup_watchdog(int timeout) {
   byte wdtcsr = 0;
   if (timeout > 0) {
-    // Enable the watchdog timer
     wdtcsr = bit(WDCE) | bit(WDE);
-    // Set the timeout
     switch (timeout) {
-      case 1: wdtcsr |= bit(WDP0); break; // 16 ms
-      case 2: wdtcsr |= bit(WDP1); break; // 32 ms
-      case 4: wdtcsr |= bit(WDP1) | bit(WDP0); break; // 64 ms
-      case 8: wdtcsr |= bit(WDP2); break; // 0.125 s
-      case 16: wdtcsr |= bit(WDP2) | bit(WDP0); break; // 0.25 s
-      case 32: wdtcsr |= bit(WDP2) | bit(WDP1); break; // 0.5 s
-      case 64: wdtcsr |= bit(WDP2) | bit(WDP1) | bit(WDP0); break; // 1 s
-      case 128: wdtcsr |= bit(WDP3); break; // 2 s
-      case 256: wdtcsr |= bit(WDP3) | bit(WDP0); break; // 4 s
-      default: wdtcsr |= bit(WDP3) | bit(WDP1); break; // 8 s
+      case 1: wdtcsr |= bit(WDP0); break;
+      case 2: wdtcsr |= bit(WDP1); break;
+      case 4: wdtcsr |= bit(WDP1) | bit(WDP0); break;
+      case 8: wdtcsr |= bit(WDP2); break;
+      case 16: wdtcsr |= bit(WDP2) | bit(WDP0); break;
+      case 32: wdtcsr |= bit(WDP2) | bit(WDP1); break;
+      case 64: wdtcsr |= bit(WDP2) | bit(WDP1) | bit(WDP0); break;
+      case 128: wdtcsr |= bit(WDP3); break;
+      case 256: wdtcsr |= bit(WDP3) | bit(WDP0); break;
+      default: wdtcsr |= bit(WDP3) | bit(WDP1); break;
     }
-    // Reset the watchdog timer
     reset_watchdog();
-    // Start the watchdog timer
     MCUSR &= ~bit(WDRF);
-    WDTCSR |= bit(WDCE) | bit(WDE);
-    WDTCSR = wdtcsr;
-  }
-  else {
-    // Disable the watchdog timer
-    MCUSR &= ~bit(WDRF);
-    WDTCSR |= bit(WDCE) | bit(WDE);
-    WDTCSR = 0x00;
+    WDTCR |= bit(WDCE) | bit(WDE);
+    WDTCR = wdtcsr | bit(WDTIE);
   }
 }
 
-// Reset the watchdog timer
-void reset_watchdog() {
-  __asm__ __volatile__ (
-    "wdr\n"
-  );
+void reset_watchdog() { wdt_reset(); }
+
+void enter_sleep(int cycles) {
+  ADCSRA &= ~bit(ADEN);
+  for (int i=0; i<cycles; i++) {
+    set_sleep_mode(SLEEP_MODE_PWR_DOWN);
+    sleep_enable();
+    sleep_mode();
+    sleep_disable();
+    reset_watchdog();
+  }
+  ADCSRA |= bit(ADEN);
 }
 
-// Enter sleep mode
-void enter_sleep() {
-  set_sleep_mode(SLEEP_MODE_PWR_DOWN); // Set the sleep mode
-  sleep_enable(); // Enable sleep mode
-  sleep_mode(); // Enter sleep mode
-  sleep_disable(); // Disable sleep mode after waking up
+void update_readings() {
+  int rawV = analogRead(VOLTAGE_PIN);
+  int rawI = analogRead(CURRENT_PIN);
+  int rawT = analogRead(TEMPERATURE_PIN);
+
+  if (rawV < SENSOR_MIN_RAW || rawV > SENSOR_MAX_RAW ||
+      rawT < SENSOR_MIN_RAW || rawT > SENSOR_MAX_RAW) {
+      sensor_fault = true;
+      stop_charging();
+  } else {
+      sensor_fault = false;
+  }
+
+  int32_t rawVoltage = ((int32_t)rawV * 5000) >> 10;
+  int32_t rawCurrent = ((int32_t)rawI * 1000) >> 10;
+  int16_t rawTemperature = (int16_t)((((int32_t)rawT * 165) >> 10) - 40);
+
+  if (first_run) {
+      smoothedVoltageQ8 = rawVoltage << 8;
+      smoothedCurrentQ8 = rawCurrent << 8;
+      smoothedTemperatureQ8 = (int32_t)rawTemperature << 8;
+      first_run = false;
+  } else {
+      smoothedVoltageQ8 = smoothedVoltageQ8 + (((rawVoltage << 8) - smoothedVoltageQ8) >> EMA_SHIFT);
+      smoothedCurrentQ8 = smoothedCurrentQ8 + (((rawCurrent << 8) - smoothedCurrentQ8) >> EMA_SHIFT);
+      smoothedTemperatureQ8 = smoothedTemperatureQ8 + ((((int32_t)rawTemperature << 8) - smoothedTemperatureQ8) >> EMA_SHIFT);
+  }
 }
 
-// Read the battery voltage
-void read_voltage() {
-  voltageValue = analogRead(VOLTAGE_PIN); // Read the analog value
-  voltage = map(voltageValue, 0, 1023, 0, 5000); // Map the value to millivolts
-}
-
-// Read the charging current
-void read_current() {
-  currentValue = analogRead(CURRENT_PIN); // Read the analog value
-  current = map(currentValue, 0, 1023, 0, 1000); // Map the value to milliamps
-}
-
-// Read the battery temperature
-void read_temperature() {
-  temperatureValue = analogRead(TEMPERATURE_PIN); // Read the analog value
-  temperature = map(temperatureValue, 0, 1023, -40, 125); // Map the value to degrees Celsius
-}
-
-// Start charging
 void start_charging() {
-  charging = true; // Set the charging flag
-  chargeValue = 255; // Set the PWM value to maximum
-  analogWrite(CHARGE_PIN, chargeValue); // Write the PWM value to the pin
+  if (temp_fault || sensor_fault) return;
+  if (smoothedVoltage < MIN_CHARGE_VOLTAGE) return;
+  charging = true;
+  chargeValue = 10;
+  analogWrite(CHARGE_PIN, chargeValue);
 }
 
-// Stop charging
 void stop_charging() {
-  charging = false; // Clear the charging flag
-  chargeValue = 0; // Set the PWM value to zero
-  analogWrite(CHARGE_PIN, chargeValue); // Write the PWM value to the pin
+  charging = false;
+  chargeValue = 0;
+  analogWrite(CHARGE_PIN, chargeValue);
 }
 
-// Adjust charging
 void adjust_charging() {
-  if (voltage >= MAX_VOLTAGE) {
-    // Battery is fully charged, stop charging
+  if (temp_fault || sensor_fault) {
+      stop_charging();
+      return;
+  }
+  if (smoothedVoltage >= MAX_VOLTAGE - 10 && smoothedCurrent <= TERMINATION_CURRENT && chargeValue < 100) {
     stop_charging();
+    return;
   }
-  else if (current >= MAX_CURRENT) {
-    // Charging current is too high, reduce the PWM value
-    chargeValue--;
-    analogWrite(CHARGE_PIN, chargeValue);
+  if (smoothedVoltage >= MAX_VOLTAGE + 50) {
+    stop_charging();
+    return;
   }
-  else if (current <= MIN_CURRENT && voltage >= MIN_VOLTAGE) {
-    // Charging current is too low, increase the PWM value
+
+  int current_target;
+  if (smoothedVoltage < PRECHARGE_THRESHOLD) {
+    current_target = PRECHARGE_CURRENT;
+  } else {
+    if (smoothedTemperature < COLD_TEMP) current_target = COLD_CURRENT;
+    else if (smoothedTemperature > WARM_TEMP) current_target = WARM_CURRENT;
+    else current_target = FASTCHARGE_CURRENT;
+  }
+
+  if (smoothedVoltage >= MAX_VOLTAGE) {
+    if (chargeValue > 0) chargeValue--;
+  }
+  else if (smoothedCurrent > current_target) {
+    if (chargeValue > 0) chargeValue--;
+  }
+  else if (chargeValue < 255) {
     chargeValue++;
-    analogWrite(CHARGE_PIN, chargeValue);
   }
+  analogWrite(CHARGE_PIN, chargeValue);
 }
 
-// Check the battery temperature
 void check_temperature() {
-  if (temperature >= MAX_TEMPERATURE || temperature <= MIN_TEMPERATURE) {
-    // Temperature is out of range, stop charging
+  if (smoothedTemperature >= MAX_TEMPERATURE || smoothedTemperature <= MIN_TEMPERATURE) {
+    temp_fault = true;
     stop_charging();
+  } else if (temp_fault) {
+    if (smoothedTemperature <= MAX_TEMP_RECOVERY && smoothedTemperature >= MIN_TEMP_RECOVERY) {
+      temp_fault = false;
+    }
   }
 }
 
-// Setup the pins and the watchdog timer
 void setup() {
-  pinMode(CHARGE_PIN, OUTPUT); // Set the charge pin as output
-  pinMode(VOLTAGE_PIN, INPUT); // Set the voltage pin as input
-  pinMode(CURRENT_PIN, INPUT); // Set the current pin as input
-  pinMode(TEMPERATURE_PIN, INPUT); // Set the temperature pin as input
-  setup_watchdog(WDT_TIMEOUT); // Setup the watchdog timer with the timeout
+  pinMode(CHARGE_PIN, OUTPUT);
+  setup_watchdog(WDT_TIMEOUT);
+  sei();
 }
 
-// Loop the measurements and the charging logic
 void loop() {
-  read_voltage(); // Read the battery voltage
-  read_current(); // Read the charging current
-  read_temperature(); // Read the battery temperature
-  if (voltage <= MIN_VOLTAGE) {
-    // Battery is too low, start charging
-    start_charging();
+  update_readings();
+  check_temperature();
+
+  if (smoothedVoltage >= MAX_VOLTAGE + 50 || sensor_fault) {
+      stop_charging();
+  } else if (!charging && smoothedVoltage <= RECHARGE_VOLTAGE && !temp_fault && !sensor_fault && smoothedVoltage >= MIN_CHARGE_VOLTAGE) {
+      start_charging();
+  } else if (charging) {
+      adjust_charging();
   }
-  else {
-    // Battery is above the minimum voltage, adjust charging
-    adjust_charging();
+
+  reset_watchdog();
+
+  if (charging) {
+      delay(10);
+  } else {
+      if (smoothedVoltage < ECO_MODE_THRESHOLD) enter_sleep(8);
+      else enter_sleep(1);
   }
-  check_temperature(); // Check the battery temperature
-  reset_watchdog(); // Reset the watchdog timer
-  delay(SLEEP_TIME * 1000); // Wait for the sleep time
-  enter_sleep(); // Enter sleep mode
 }
+
+EMPTY_INTERRUPT(WDT_vect);

@@ -1,6 +1,6 @@
-// Arduino code for attiny13 li-ion battery charger with load control
-// Features: CC/CV, Pre-charging, Load PWM scaling, Hysteresis, Smoothing, Multi-stage Thermal Control, Power Management
-// Production Quality: Fixed-point math, Integer EMA with precision, Robust Sensor Sanity Checks
+// Arduino code for attiny13 li-ion battery charger with load control and thermistor temperature measurement
+// Features: CC/CV, Pre-charging, Cap-based NTC, Load PWM, Smoothing, Multi-stage Thermal Control, Power Management
+// Production Quality: Fixed-point math, No float, Integer EMA, Linear interpolation for temperature, Robust Sensor Sanity Checks
 
 #include <avr/io.h>
 #include <avr/wdt.h>
@@ -10,9 +10,10 @@
 // ATtiny13 Pin Mapping
 #define CHARGE_PIN 0
 #define LOAD_PIN 1
-#define VOLTAGE_PIN 1 // ADC1 (PB2)
-#define CURRENT_PIN 2 // ADC2 (PB4)
-#define TEMPERATURE_PIN 3 // ADC3 (PB3)
+#define VOLTAGE_PIN 1
+#define CURRENT_PIN 2
+#define TEMPERATURE_PIN 3
+#define REFERENCE_PIN 5
 
 #define MAX_VOLTAGE 4200
 #define RECHARGE_VOLTAGE 4050
@@ -100,13 +101,34 @@ void enter_sleep(int cycles) {
   ADCSRA |= bit(ADEN);
 }
 
+uint32_t measure_discharge_time(uint8_t pin) {
+  pinMode(pin, OUTPUT);
+  digitalWrite(pin, HIGH);
+  delay(10);
+  pinMode(pin, INPUT);
+  uint32_t startTime = micros();
+  while (digitalRead(pin) == HIGH) {
+      if (micros() - startTime > 100000) break;
+  }
+  return micros() - startTime;
+}
+
+int16_t calculate_temp_fixed(uint32_t t_ref, uint32_t t_ntc) {
+    if (t_ref == 0) return 25;
+    uint32_t ratio_q10 = (t_ntc << 10) / t_ref;
+    if (ratio_q10 > 1024) {
+        return 25 - (int16_t)(((ratio_q10 - 1024) * 25) / 2253);
+    } else {
+        int32_t diff = 1024 - (int32_t)ratio_q10;
+        return 25 + (int16_t)((diff * 20) / 574);
+    }
+}
+
 void update_readings() {
   int rawV = analogRead(VOLTAGE_PIN);
   int rawI = analogRead(CURRENT_PIN);
-  int rawT = analogRead(TEMPERATURE_PIN);
 
-  if (rawV < SENSOR_MIN_RAW || rawV > SENSOR_MAX_RAW ||
-      rawT < SENSOR_MIN_RAW || rawT > SENSOR_MAX_RAW) {
+  if (rawV < SENSOR_MIN_RAW || rawV > SENSOR_MAX_RAW) {
       sensor_fault = true;
       stop_charging();
   } else {
@@ -115,7 +137,15 @@ void update_readings() {
 
   int32_t rawVoltage = ((int32_t)rawV * 5000) >> 10;
   int32_t rawCurrent = ((int32_t)rawI * 1000) >> 10;
-  int16_t rawTemperature = (int16_t)((((int32_t)rawT * 165) >> 10) - 40);
+
+  uint32_t t_ref = measure_discharge_time(REFERENCE_PIN);
+  uint32_t t_ntc = measure_discharge_time(TEMPERATURE_PIN);
+  int16_t rawTemperature = calculate_temp_fixed(t_ref, t_ntc);
+
+  uint32_t ratio_q10 = (t_ref > 0) ? (t_ntc << 10) / t_ref : 0;
+  if (ratio_q10 < 200 || ratio_q10 > 5000 || t_ref == 0) {
+      rawTemperature = 100; // Trigger fault
+  }
 
   if (first_run) {
       smoothedVoltageQ8 = rawVoltage << 8;
@@ -205,6 +235,8 @@ void control_load() {
 void setup() {
   pinMode(CHARGE_PIN, OUTPUT);
   pinMode(LOAD_PIN, OUTPUT);
+  pinMode(REFERENCE_PIN, INPUT);
+  pinMode(TEMPERATURE_PIN, INPUT);
   setup_watchdog(WDT_TIMEOUT);
   sei();
 }
