@@ -32,10 +32,13 @@ extern uint8_t ADMUX;
 #define WDE  3
 #define WDCE 4
 #define WDRF 3
+#define WDTIE 6
 
 #define ACBG 6
 #define ACIE 3
 #define ACI  4
+
+#define ADEN 7
 
 #define ANALOG_COMP_vect
 #define ISR(vector) void vector##_impl()
@@ -78,13 +81,17 @@ int getPWMValue(uint8_t pin);
 void resetMock();
 void setDischargeTime(uint8_t pin, int time_us);
 
+// Sleep tracking
+extern int sleepCallCount;
+void resetSleepCount();
+
 // Battery and Environment simulation
 struct BatterySim {
-    float ocv_mv;       // Open Circuit Voltage (mV)
-    float ir_ohms;      // Internal Resistance (Ohms)
-    float capacity_mah; // Capacity (mAh)
-    float current_ma;   // Current (mA)
-    float temp_c;       // Temperature (Celsius)
+    float ocv_mv;
+    float ir_ohms;
+    float capacity_mah;
+    float current_ma;
+    float temp_c;
 };
 
 extern BatterySim globalBattery;

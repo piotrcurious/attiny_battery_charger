@@ -1,5 +1,5 @@
 // Arduino code for attiny13 li-ion battery charger with load control
-// Features: CC/CV, Pre-charging, Load PWM scaling, Hysteresis, Smoothing, Multi-stage Thermal Control
+// Features: CC/CV, Pre-charging, Load PWM scaling, Hysteresis, Smoothing, Multi-stage Thermal Control, Power Management
 // Disclaimer: This code is for educational purposes only and not intended to be used in real applications.
 
 #include <avr/io.h>
@@ -8,45 +8,44 @@
 #include <avr/interrupt.h>
 
 // Define the pins
-#define CHARGE_PIN 0 // PWM pin to control the charging MOSFET
-#define VOLTAGE_PIN 1 // Analog pin to measure the battery voltage
-#define CURRENT_PIN 2 // Analog pin to measure the charging current
-#define TEMPERATURE_PIN 3 // Analog pin to measure the battery temperature
-#define LOAD_PIN 4 // PWM pin to control the load MOSFET
+#define CHARGE_PIN 0
+#define VOLTAGE_PIN 1
+#define CURRENT_PIN 2
+#define TEMPERATURE_PIN 3
+#define LOAD_PIN 4
 
 // Define the constants
-#define MAX_VOLTAGE 4200 // Maximum charge voltage in millivolts
-#define RECHARGE_VOLTAGE 4050 // Voltage to restart charging in millivolts
-#define PRECHARGE_THRESHOLD 3000 // Voltage to switch from pre-charge to fast-charge in millivolts
-#define PRECHARGE_CURRENT 50 // Current limit for pre-charging in milliamps
-
-// Longevity-optimized Thermal Zones
-#define FASTCHARGE_CURRENT 500 // Max current at ideal temp (10-35°C)
-#define COLD_TEMP 10 // Below this, reduce current
-#define COLD_CURRENT 100 // Max current at cold temp (0-10°C)
-#define WARM_TEMP 35 // Above this, reduce current
-#define WARM_CURRENT 250 // Max current at warm temp (35-45°C)
-
-#define TERMINATION_CURRENT 50 // Current to terminate charging in CV phase in milliamps
-#define MAX_TEMPERATURE 45 // Maximum temperature to charge in degrees Celsius
-#define MAX_TEMP_RECOVERY 40 // Temperature to restart charging after over-temp
-#define MIN_TEMPERATURE 0 // Minimum temperature to charge in degrees Celsius
-#define MIN_TEMP_RECOVERY 5 // Temperature to restart charging after under-temp
-#define MAX_LOAD_VOLTAGE 4000 // Maximum battery voltage to allow maximum load PWM in millivolts
-#define MIN_LOAD_VOLTAGE 3200 // Minimum battery voltage to allow minimum load PWM in millivolts
-#define MAX_LOAD_PWM 255 // Maximum load PWM value
-#define MIN_LOAD_PWM 0 // Minimum load PWM value
-#define WDT_TIMEOUT 8 // Watchdog timer timeout in seconds
-#define ALPHA 0.2 // Smoothing factor for EMA (0.0 to 1.0)
+#define MAX_VOLTAGE 4200
+#define RECHARGE_VOLTAGE 4050
+#define PRECHARGE_THRESHOLD 3000
+#define ECO_MODE_THRESHOLD 2500
+#define PRECHARGE_CURRENT 50
+#define FASTCHARGE_CURRENT 500
+#define COLD_TEMP 10
+#define COLD_CURRENT 100
+#define WARM_TEMP 35
+#define WARM_CURRENT 250
+#define TERMINATION_CURRENT 50
+#define MAX_TEMPERATURE 45
+#define MAX_TEMP_RECOVERY 40
+#define MIN_TEMPERATURE 0
+#define MIN_TEMP_RECOVERY 5
+#define MIN_CHARGE_VOLTAGE 2000
+#define MAX_LOAD_VOLTAGE 4000
+#define MIN_LOAD_VOLTAGE 3200
+#define MAX_LOAD_PWM 255
+#define MIN_LOAD_PWM 0
+#define WDT_TIMEOUT 8
+#define ALPHA 0.2
 
 // Define the variables
-int chargeValue = 0; // PWM value to control the charging MOSFET
-float smoothedVoltage = 0; // Smoothed battery voltage in millivolts
-float smoothedCurrent = 0; // Smoothed charging current in milliamps
-float smoothedTemperature = 25; // Smoothed battery temperature in degrees Celsius
-int loadValue = 0; // PWM value to control the load MOSFET
-bool charging = false; // Charging status flag
-bool temp_fault = false; // Temperature fault flag
+int chargeValue = 0;
+float smoothedVoltage = 0;
+float smoothedCurrent = 0;
+float smoothedTemperature = 25;
+int loadValue = 0;
+bool charging = false;
+bool temp_fault = false;
 
 // Forward declarations
 void reset_watchdog();
@@ -72,16 +71,23 @@ void setup_watchdog(int timeout) {
     reset_watchdog();
     MCUSR &= ~bit(WDRF);
     WDTCR |= bit(WDCE) | bit(WDE);
-    WDTCR = wdtcsr;
-  }
-  else {
-    MCUSR &= ~bit(WDRF);
-    WDTCR |= bit(WDCE) | bit(WDE);
-    WDTCR = 0x00;
+    WDTCR = wdtcsr | bit(WDTIE);
   }
 }
 
 void reset_watchdog() { wdt_reset(); }
+
+void enter_sleep(int cycles) {
+  ADCSRA &= ~bit(ADEN);
+  for (int i=0; i<cycles; i++) {
+    set_sleep_mode(SLEEP_MODE_PWR_DOWN);
+    sleep_enable();
+    sleep_mode();
+    sleep_disable();
+    reset_watchdog();
+  }
+  ADCSRA |= bit(ADEN);
+}
 
 void update_readings() {
   int rawVoltage = map(analogRead(VOLTAGE_PIN), 0, 1023, 0, 5000);
@@ -97,6 +103,7 @@ void update_readings() {
 
 void start_charging() {
   if (temp_fault) return;
+  if (smoothedVoltage < MIN_CHARGE_VOLTAGE) return;
   charging = true;
   chargeValue = 10;
   analogWrite(CHARGE_PIN, chargeValue);
@@ -113,12 +120,10 @@ void adjust_charging() {
     stop_charging();
     return;
   }
-
   if (smoothedVoltage >= MAX_VOLTAGE - 10 && smoothedCurrent <= TERMINATION_CURRENT && chargeValue < 100) {
     stop_charging();
     return;
   }
-
   if (smoothedVoltage >= MAX_VOLTAGE + 50) {
     stop_charging();
     return;
@@ -128,14 +133,9 @@ void adjust_charging() {
   if (smoothedVoltage < PRECHARGE_THRESHOLD) {
     current_target = PRECHARGE_CURRENT;
   } else {
-    // Determine target current based on temperature for longevity
-    if (smoothedTemperature < COLD_TEMP) {
-      current_target = COLD_CURRENT;
-    } else if (smoothedTemperature > WARM_TEMP) {
-      current_target = WARM_CURRENT;
-    } else {
-      current_target = FASTCHARGE_CURRENT;
-    }
+    if (smoothedTemperature < COLD_TEMP) current_target = COLD_CURRENT;
+    else if (smoothedTemperature > WARM_TEMP) current_target = WARM_CURRENT;
+    else current_target = FASTCHARGE_CURRENT;
   }
 
   if (smoothedVoltage >= MAX_VOLTAGE) {
@@ -147,7 +147,6 @@ void adjust_charging() {
   else if (chargeValue < 255) {
     chargeValue++;
   }
-
   analogWrite(CHARGE_PIN, chargeValue);
 }
 
@@ -182,6 +181,7 @@ void setup() {
   pinMode(TEMPERATURE_PIN, INPUT);
   pinMode(LOAD_PIN, OUTPUT);
   setup_watchdog(WDT_TIMEOUT);
+  sei();
 }
 
 void loop() {
@@ -190,7 +190,7 @@ void loop() {
 
   if (smoothedVoltage >= MAX_VOLTAGE + 50) {
       stop_charging();
-  } else if (!charging && smoothedVoltage <= RECHARGE_VOLTAGE && !temp_fault) {
+  } else if (!charging && smoothedVoltage <= RECHARGE_VOLTAGE && !temp_fault && smoothedVoltage >= MIN_CHARGE_VOLTAGE) {
       start_charging();
   } else if (charging) {
       adjust_charging();
@@ -198,5 +198,13 @@ void loop() {
 
   control_load();
   reset_watchdog();
-  delay(10);
+
+  if (charging) {
+      delay(10);
+  } else {
+      if (smoothedVoltage < ECO_MODE_THRESHOLD) enter_sleep(8);
+      else enter_sleep(1);
+  }
 }
+
+EMPTY_INTERRUPT(WDT_vect);
